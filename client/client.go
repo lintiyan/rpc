@@ -15,9 +15,10 @@ import (
 )
 
 type RPCClient interface {
-	Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) error
+	Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error)
 	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Close() error
+	IsShutDown() bool
 }
 
 type Call struct {
@@ -58,10 +59,11 @@ func NewSimpleClient(network, addr string, option Option) (*SimpleClient, error)
 	return sc, nil
 }
 
+// 参数中带有done channel是因为可以让调用这通过done这个通道来感知该请求是否结束
 func (s *SimpleClient) Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error) {
 
-	seq := ctx.Value(protocol.RequestSeqKey).(uint64)
-	if seq == 0 {
+	seq, ok := ctx.Value(protocol.RequestSeqKey).(uint64)
+	if !ok || seq == 0 {
 		ctx = context.WithValue(ctx, protocol.RequestSeqKey, atomic.AddUint64(&s.seq, 1))
 	}
 
@@ -156,6 +158,10 @@ func (s *SimpleClient) send(ctx context.Context, call *Call) error {
 	return nil
 }
 
+func (s *SimpleClient) IsShutDown() bool {
+	return s.shutdown
+}
+
 func (s *SimpleClient) Close() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -181,7 +187,7 @@ func (s *SimpleClient) input() {
 			fmt.Println("input|DecodeMessage failed. err=", err)
 			continue
 		}
-
+		fmt.Println("message.data=", string(message.Data))
 		if message == nil {
 			continue
 		}

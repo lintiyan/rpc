@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -18,6 +20,12 @@ type RPCServer interface {
 	Register(rcv interface{}, metaData map[string]string) error
 	Serve(network string, addr string) error
 	Close() error
+	Services() []ServiceInfo
+}
+
+type ServiceInfo struct {
+	Name    string   `json:"name"`
+	Methods []string `json:"methods"`
 }
 
 /*
@@ -35,17 +43,40 @@ type RPCServer interface {
 
 */
 
-type SimpleServer struct {
+type SGServer struct {
 	codec      codec.Codec               // 序列化方式
 	tr         transport.ServerTransport // 网络传输方式
 	serviceMap sync.Map                  // 服务的map
 	shutdown   bool
 	option     Option // 选项
 	mutex      sync.Mutex
+
+	RequestInProcess int64 // 处理中的请求数量
 }
 
-func NewSimpleServer(option Option) RPCServer {
-	s := &SimpleServer{}
+func (s *SGServer) Services() []ServiceInfo {
+
+	var services []ServiceInfo
+	s.serviceMap.Range(func(key, value interface{}) bool {
+
+		sName := key.(string)
+		service, ok := value.(*Service)
+		if !ok {
+			return false
+		}
+		var methods []string
+		for _, method := range service.methods {
+			methods = append(methods, method.method.Name)
+		}
+		services = append(services, ServiceInfo{sName, methods})
+		return true
+	})
+
+	return services
+}
+
+func NewSGServer(option Option) RPCServer {
+	s := &SGServer{}
 	s.option = option
 	return s
 }
@@ -63,7 +94,7 @@ type Service struct {
 	methods map[string]*methodType
 }
 
-func (s *SimpleServer) Register(srv interface{}, metaData map[string]string) error {
+func (s *SGServer) Register(srv interface{}, metaData map[string]string) error {
 
 	srvType := reflect.TypeOf(srv)
 	srvName := srvType.Name()
@@ -188,30 +219,63 @@ func isExported(name string) bool {
 	return unicode.IsUpper(rune)
 }
 
-func (s *SimpleServer) Serve(network, addr string) error {
+func WrapperServe(server *SGServer) ServeFunc {
+	serve := server.serve
+	for _, wrapper := range server.option.Wrappers {
+		serve = wrapper.WrapperServe(server, serve)
+	}
+	return serve
+}
+
+func (s *SGServer) Serve(network, addr string) error {
+	return WrapperServe(s)(network, addr)
+}
+
+func WrapperTransport(server *SGServer) TransportFunc {
+	tp := server.serveTransport
+	for _, wrapper := range server.option.Wrappers {
+		tp = wrapper.WrapperTransport(server, tp)
+	}
+	return tp
+}
+
+func (s *SGServer) ServeTransport(conn transport.Transport) {
+	WrapperTransport(s)(conn)
+}
+
+func WrapperDoHandlerRequest(server *SGServer) DoHandleRequestFunc {
+	doHandlerReqFunc := server.doHandleRequest
+	for _, wrapper := range server.option.Wrappers {
+		doHandlerReqFunc = wrapper.WrapperDoHandleRequest(server, doHandlerReqFunc)
+	}
+	return doHandlerReqFunc
+}
+
+func (s *SGServer) serve(network, addr string) error {
 	s.tr = transport.NewServerTransport(s.option.TransportType)
 	err := s.tr.Listen(network, addr)
 	if err != nil {
+		fmt.Println("Listen:", err)
 		return err
 	}
 
 	for {
+		if s.shutdown {
+			return nil
+		}
 		conn, err := s.tr.Accept()
 		if err != nil {
-			fmt.Println(err)
+			if strings.Contains(err.Error(), "use of closed network connection") && s.shutdown {
+				return nil
+			}
+			fmt.Println("Accept:", err)
 			return err
 		}
 		go s.ServeTransport(conn)
 	}
 }
 
-func (s *SimpleServer) ServeTransport(conn transport.Transport) {
-
-	defer func() {
-		if err := recover(); err!=nil{
-			fmt.Println(err)
-		}
-	}()
+func (s *SGServer) serveTransport(conn transport.Transport) {
 
 	for {
 		// 通过Transport拿到消息，并解码得到message信息
@@ -221,99 +285,115 @@ func (s *SimpleServer) ServeTransport(conn transport.Transport) {
 			return
 		}
 		resp := req.Clone()
-
-		// 根据msg获得请求的是哪个服务的哪个接口
-		serviceName := req.Header.ServiceName
-		methodName := req.Header.MethodName
-
-		// 获得服务信息
-		serviceInterface, ok := s.serviceMap.Load(serviceName)
-		if !ok {
-			s.writeErrorResp(resp, conn, "service not found")
-			return
-		}
-		service, ok := serviceInterface.(*Service)
-		if !ok {
-			s.writeErrorResp(resp, conn, "not *service type")
-			return
-		}
-		// 获得方法
-		method, ok := service.methods[methodName]
-		if !ok {
-			s.writeErrorResp(resp, conn, "method not found")
-			return
-		}
-
-		// 参数补充
 		ctx := context.Background()
-		arg := newValue(method.ArgType)
-		reply := newValue(method.ReplyType)
-
-		// 从请求的data中得到真实的参数
-		err = codec.GetCodec(s.option.SerializeType).Decode(req.Data, arg)
-		if err != nil {
-			s.writeErrorResp(resp, conn, "arg is wrong")
-			return
-		}
-		// 规定方法必然是类型方法，第一个参数是ctx，第二个参数是入参，第三个参数是接受真实的返回值。
-		// 如： func (s Service) Add(ctx context.Context, uid int64, info UserInfo) error {}
-
-		// 反射调用方法
-		var returns []reflect.Value // returns是方法执行的返回值
-		if method.ArgType.Kind() != reflect.Ptr {
-			returns = method.method.Func.Call([]reflect.Value{
-				service.rcvr,                // 第一个参数必然是服务的类型
-				reflect.ValueOf(ctx),        // 第二个参数是ctx
-				reflect.ValueOf(arg).Elem(), // 第三个参数是真实参数
-				reflect.ValueOf(reply),      // 第四个参数是接受响应数据
-			})
-		} else {
-			returns = method.method.Func.Call([]reflect.Value{
-				service.rcvr,
-				reflect.ValueOf(ctx),
-				reflect.ValueOf(arg),
-				reflect.ValueOf(reply),
-			})
-		}
-		// 根据约定，如果返回值不为空，则必定有异常
-		if len(returns) != 0 && returns[0].Interface() != nil {
-			err := returns[0].Interface().(error)
-			s.writeErrorResp(resp, conn, err.Error())
-			return
-		}
-
-		data, err := codec.GetCodec(s.option.SerializeType).Encode(reply)
-		if err != nil {
-			s.writeErrorResp(resp, conn, "codec failed. err="+err.Error())
-			return
-		}
-
-		resp.Data = data
-		resp.StatusCode = protocol.ServiceOKCode
-
-		_, err = conn.Write(protocol.NewProtocol(s.option.ProtocolType).EncodeMessage(resp))
-		if err != nil {
-			return
-		}
+		WrapperDoHandlerRequest(s)(ctx, req, resp, conn)
 	}
 }
 
-func (s *SimpleServer) Close() error {
+func (s *SGServer) doHandleRequest(ctx context.Context, req, resp *protocol.Message, conn transport.Transport) {
+	fmt.Println("s.RequestInProcess = ",s.RequestInProcess)
+	//time.Sleep(2*time.Second)
+	// 根据msg获得请求的是哪个服务的哪个接口
+	serviceName := req.Header.ServiceName
+	methodName := req.Header.MethodName
+
+	// 获得服务信息
+	serviceInterface, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		s.writeErrorResp(resp, conn, "service not found")
+		return
+	}
+	service, ok := serviceInterface.(*Service)
+	if !ok {
+		s.writeErrorResp(resp, conn, "not *service type")
+		return
+	}
+	// 获得方法
+	method, ok := service.methods[methodName]
+	if !ok {
+		s.writeErrorResp(resp, conn, "method not found")
+		return
+	}
+
+	// 参数补充
+
+	arg := newValue(method.ArgType)
+	reply := newValue(method.ReplyType)
+
+	// 从请求的data中得到真实的参数
+	err := codec.GetCodec(s.option.SerializeType).Decode(req.Data, arg)
+	if err != nil {
+		s.writeErrorResp(resp, conn, "arg is wrong")
+		return
+	}
+	// 规定方法必然是类型方法，第一个参数是ctx，第二个参数是入参，第三个参数是接受真实的返回值。
+	// 如： func (s Service) Add(ctx context.Context, uid int64, info UserInfo) error {}
+
+	// 反射调用方法
+	var returns []reflect.Value // returns是方法执行的返回值
+	if method.ArgType.Kind() != reflect.Ptr {
+		returns = method.method.Func.Call([]reflect.Value{
+			service.rcvr,                // 第一个参数必然是服务的类型
+			reflect.ValueOf(ctx),        // 第二个参数是ctx
+			reflect.ValueOf(arg).Elem(), // 第三个参数是真实参数
+			reflect.ValueOf(reply),      // 第四个参数是接受响应数据
+		})
+	} else {
+		returns = method.method.Func.Call([]reflect.Value{
+			service.rcvr,
+			reflect.ValueOf(ctx),
+			reflect.ValueOf(arg),
+			reflect.ValueOf(reply),
+		})
+	}
+	// 根据约定，如果返回值不为空，则必定有异常
+	if len(returns) != 0 && returns[0].Interface() != nil {
+		err := returns[0].Interface().(error)
+		s.writeErrorResp(resp, conn, err.Error())
+		return
+	}
+
+	fmt.Println("reply=",reply)
+
+	data, err := codec.GetCodec(s.option.SerializeType).Encode(reply)
+	if err != nil {
+		s.writeErrorResp(resp, conn, "codec failed. err="+err.Error())
+		return
+	}
+
+	resp.Data = data
+	resp.StatusCode = protocol.ServiceOKCode
+
+	_, err = conn.Write(protocol.NewProtocol(s.option.ProtocolType).EncodeMessage(resp))
+	if err != nil {
+		return
+	}
+}
+
+func (s *SGServer) Close() error {
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
 	s.shutdown = true
 
-	s.serviceMap.Range(func(key, value interface{}) bool {
-		s.serviceMap.Delete(key)
-		return true
-	})
-
-	return nil
+	// 等所有请求执行完毕，或者到指定时间停止
+	ticker := time.NewTicker(time.Duration(s.option.ShutdownWait) * time.Second)
+	defer ticker.Stop()
+	for {
+		if s.RequestInProcess <= 0 {
+			break
+		}
+		select {
+		case <-ticker.C:
+			break
+		}
+	}
+	fmt.Println("sg.Close. time=", time.Now().Format("2006-01-02 15:04:05"))
+	return s.tr.Close()
 }
 
-func (s *SimpleServer) writeErrorResp(resp *protocol.Message, tr transport.Transport, errMsg string) {
+func (s *SGServer) writeErrorResp(resp *protocol.Message, tr transport.Transport, errMsg string) {
 	resp.Error = errMsg
 	resp.StatusCode = protocol.ServiceErrorCode
 	tr.Write(protocol.NewProtocol(s.option.ProtocolType).EncodeMessage(resp))
