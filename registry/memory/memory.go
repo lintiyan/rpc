@@ -18,7 +18,7 @@ func (p *MemRegistry) Register(registerOption registry.RegisterOption, providers
 	defer p.mu.Unlock()
 
 	// 发送注册事件
-	p.sendWatcherEvent(registry.Create, registerOption.AppKey, providers...)
+	go p.sendWatcherEvent(registry.Create, registerOption.AppKey, providers...)
 
 	var newProviders []registry.Provider
 	for _, provider := range providers {
@@ -42,7 +42,7 @@ func (p *MemRegistry) UnRegister(registerOption registry.RegisterOption, provide
 	defer p.mu.Unlock()
 
 	// 发送注册事件
-	p.sendWatcherEvent(registry.Delete, registerOption.AppKey, providers...)
+	go p.sendWatcherEvent(registry.Delete, registerOption.AppKey, providers...)
 
 	var newProviders []registry.Provider
 	for _, provider := range providers {
