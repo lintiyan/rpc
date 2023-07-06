@@ -21,9 +21,10 @@ type Wrapper interface {
 
 type DefaultWrapper struct{}
 
-func (d DefaultWrapper) WrapperServe(s *SGServer, serve ServeFunc) ServeFunc {
+func (d *DefaultWrapper) WrapperServe(s *SGServer, serve ServeFunc) ServeFunc {
 
 	return func(network, addr string) error {
+
 		// 服务注册
 		services, _ := json.Marshal(s.Services())
 		provider := registry.Provider{
@@ -35,16 +36,15 @@ func (d DefaultWrapper) WrapperServe(s *SGServer, serve ServeFunc) ServeFunc {
 
 		registry := s.option.Registry
 		registry.Register(s.option.RegistryOption, provider)
-
 		return serve(network, addr)
 	}
 }
 
-func (d DefaultWrapper) WrapperTransport(s *SGServer, tr TransportFunc) TransportFunc {
+func (d *DefaultWrapper) WrapperTransport(s *SGServer, tr TransportFunc) TransportFunc {
 	return tr
 }
 
-func (d DefaultWrapper) WrapperDoHandleRequest(s *SGServer, hr DoHandleRequestFunc) DoHandleRequestFunc {
+func (d *DefaultWrapper) WrapperDoHandleRequest(s *SGServer, hr DoHandleRequestFunc) DoHandleRequestFunc {
 	return func(ctx context.Context, request *protocol.Message, response *protocol.Message, tr transport.Transport) {
 		atomic.AddInt64(&s.RequestInProcess, 1)
 		hr(ctx, request, response, tr)

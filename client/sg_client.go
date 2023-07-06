@@ -116,6 +116,7 @@ func (s *sgClient) SelectClient(ctx context.Context, serviceMethod string, args 
 	if err != nil {
 		return provider, nil, err
 	}
+	fmt.Println("provider=", provider.ProviderKey)
 	client, err := s.getClient(provider)
 	if err != nil {
 		return provider, client, err

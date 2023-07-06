@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"distribute/rpc/client"
-	"distribute/rpc/registry/p2p"
+	"distribute/rpc/registry/memory"
 	"distribute/rpc/server"
 	"fmt"
 	"time"
@@ -13,10 +13,11 @@ func main() {
 
 	serviceOption := server.DefaultOption
 
-	registry := &p2p.PTPRegistry{}
+	//registry := &p2p.PTPRegistry{}
+	registry := &memory.MemRegistry{}
 	serviceOption.Registry = registry
 	serviceOption.RegistryOption.AppKey = "my-app"
-	serviceOption.Wrappers = append(serviceOption.Wrappers, server.DefaultWrapper{})
+	serviceOption.Wrappers = append(serviceOption.Wrappers, &server.DefaultWrapper{})
 	serviceOption.ShutdownWait = 6
 	srv := server.NewSGServer(serviceOption)
 
@@ -34,7 +35,16 @@ func main() {
 		}
 	}()
 
+	go func() {
+		err := srv.Serve("tcp", ":9998")
+		if err != nil {
+			panic(err)
+		}
+	}()
+
 	time.Sleep(5 * time.Second)
+
+	fmt.Println("providers= ",registry.Providers)
 
 	clientOption := client.DefaultSGOption
 	clientOption.AppKey = "my-app"
@@ -62,6 +72,8 @@ func main() {
 			fmt.Println(call.Reply)
 		}
 	}()
+
+	time.Sleep(5 * time.Second)
 
 	srv.Close()
 }

@@ -219,46 +219,52 @@ func isExported(name string) bool {
 	return unicode.IsUpper(rune)
 }
 
-func WrapperServe(server *SGServer) ServeFunc {
-	serve := server.serve
-	for _, wrapper := range server.option.Wrappers {
-		serve = wrapper.WrapperServe(server, serve)
+func (s *SGServer) WrapperServe(serve ServeFunc) ServeFunc {
+
+	for _, wrapper := range s.option.Wrappers {
+		serve = wrapper.WrapperServe(s, serve)
 	}
+
 	return serve
 }
 
 func (s *SGServer) Serve(network, addr string) error {
-	return WrapperServe(s)(network, addr)
+	defer func() {
+		if err := recover(); err!=nil {
+			fmt.Println(err)
+		}
+	}()
+	return (s.WrapperServe(s.serve))(network, addr)
 }
 
-func WrapperTransport(server *SGServer) TransportFunc {
-	tp := server.serveTransport
-	for _, wrapper := range server.option.Wrappers {
-		tp = wrapper.WrapperTransport(server, tp)
+func (s *SGServer) WrapperTransport(tp TransportFunc) TransportFunc {
+
+	for _, wrapper := range s.option.Wrappers {
+		tp = wrapper.WrapperTransport(s, tp)
 	}
 	return tp
 }
 
 func (s *SGServer) ServeTransport(conn transport.Transport) {
-	WrapperTransport(s)(conn)
+	st := s.serveTransport
+	s.WrapperTransport(st)(conn)
 }
 
-func WrapperDoHandlerRequest(server *SGServer) DoHandleRequestFunc {
-	doHandlerReqFunc := server.doHandleRequest
-	for _, wrapper := range server.option.Wrappers {
-		doHandlerReqFunc = wrapper.WrapperDoHandleRequest(server, doHandlerReqFunc)
+func (s *SGServer) WrapperDoHandlerRequest(dhr DoHandleRequestFunc) DoHandleRequestFunc {
+	for _, wrapper := range s.option.Wrappers {
+		dhr = wrapper.WrapperDoHandleRequest(s, dhr)
 	}
-	return doHandlerReqFunc
+	return dhr
 }
 
 func (s *SGServer) serve(network, addr string) error {
+
 	s.tr = transport.NewServerTransport(s.option.TransportType)
 	err := s.tr.Listen(network, addr)
 	if err != nil {
 		fmt.Println("Listen:", err)
 		return err
 	}
-
 	for {
 		if s.shutdown {
 			return nil
@@ -286,12 +292,12 @@ func (s *SGServer) serveTransport(conn transport.Transport) {
 		}
 		resp := req.Clone()
 		ctx := context.Background()
-		WrapperDoHandlerRequest(s)(ctx, req, resp, conn)
+		s.WrapperDoHandlerRequest(s.doHandleRequest)(ctx, req, resp, conn)
 	}
 }
 
 func (s *SGServer) doHandleRequest(ctx context.Context, req, resp *protocol.Message, conn transport.Transport) {
-	fmt.Println("s.RequestInProcess = ",s.RequestInProcess)
+
 	//time.Sleep(2*time.Second)
 	// 根据msg获得请求的是哪个服务的哪个接口
 	serviceName := req.Header.ServiceName
@@ -389,7 +395,7 @@ func (s *SGServer) Close() error {
 			break
 		}
 	}
-	fmt.Println("sg.Close. time=", time.Now().Format("2006-01-02 15:04:05"))
+
 	return s.tr.Close()
 }
 
